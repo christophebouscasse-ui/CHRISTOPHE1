@@ -10,7 +10,7 @@ L'utilisateur donne un lien Google Drive vers un fichier CSV et pose des questio
 - `filter_rows` : filtre les lignes avec un opérateur fixe (eq, ne, gt, ge, lt, le, contains, isin, is_null, ...) ;
 - `aggregate_by_group` : agrégats par groupe (count, sum, mean, median, min, max, std, nunique).
 
-Aucune exécution de code arbitraire : `NoSandbox` (pas de shell/fichiers), `programmatic_tool_calling=False` (pas de `run_typescript`), outils en `model_access="direct"`.
+Aucune exécution de code système : `NoSandbox` (pas de shell/fichiers/réseau ; le runtime TypeScript de `run_typescript` n'expose que le catalogue d'outils déclarés), outils propres en `model_access="direct"`, et `PermissionPolicy` qui refuse en dur les outils d'écriture du connecteur Drive (`create_file`, `update_file`, `copy_file`) : le Drive est en lecture seule.
 
 La session (hébergée par Mistral Cloud) conserve l'historique et le jeu de données chargé : les questions de suivi se posent sans se réexpliquer.
 
