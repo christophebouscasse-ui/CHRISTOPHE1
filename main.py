@@ -444,4 +444,3 @@ agent = agents.Agent(
     max_iterations=30,
     first_output_timeout_seconds=900,
 )
-)
