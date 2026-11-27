@@ -278,6 +278,108 @@ def aggregate_by_group(
     }
 
 
+MAX_EXPORT_ROWS = 20_000
+MAX_PART_CSV_ROWS = 5_000
+
+
+@agents.tool(model_access="direct")
+def add_rows(
+    ctx: agents.ToolCallbackContext,
+    /,
+    rows: Annotated[
+        list[dict[str, Any]],
+        Field(description="Lignes à ajouter : objets {colonne: valeur}. Les clés doivent être des colonnes existantes du jeu chargé ; les colonnes manquantes seront vides."),
+    ],
+) -> dict[str, Any]:
+    """Ajoute des lignes au jeu de données chargé en mémoire (ex : données trouvées lors de recherches dans Drive ou collées par l'utilisateur). Ne modifie jamais le fichier Drive d'origine."""
+    df, info = _dataset(ctx)
+    if not rows:
+        raise agents.ToolError("rows est vide : fournis au moins une ligne {colonne: valeur}.")
+    cols = [str(c) for c in df.columns]
+    unknown = sorted({str(k) for r in rows for k in r} - set(cols))
+    if unknown:
+        raise agents.ToolError(
+            f"Colonnes inconnues {unknown}. Colonnes du jeu chargé : {cols}. N'invente pas de colonnes."
+        )
+    new = pd.DataFrame(rows).reindex(columns=df.columns)
+    combined = pd.concat([df, new], ignore_index=True)
+    _DATASETS[ctx.session.id] = combined
+    return {
+        "file_name": info["file_name"],
+        "added": int(len(new)),
+        "row_count": int(len(combined)),
+        "columns": cols,
+        "sample_added": _records(new.head(10)),
+        "note": "Ajouté en mémoire de session uniquement. Pour sauvegarder dans Drive : export_csv puis create_file (voir instructions).",
+    }
+
+
+@agents.tool(model_access="direct")
+def export_csv(
+    ctx: agents.ToolCallbackContext,
+    /,
+    start_row: Annotated[int, Field(description="Première ligne à exporter (0 = début).", ge=0)] = 0,
+    end_row: Annotated[int | None, Field(description="Ligne de fin exclusive. Toutes les lignes si omis.", ge=0)] = None,
+    sep: Annotated[Literal[";", ",", "\t"], Field(description="Délimiteur du CSV exporté.")] = ";",
+) -> dict[str, Any]:
+    """Exporte une tranche du jeu de données chargé en texte CSV (avec en-tête), par ex. pour sauvegarder le fichier enrichi dans Google Drive avec create_file."""
+    df, info = _dataset(ctx)
+    total = len(df)
+    start = max(0, start_row)
+    end = total if end_row is None else min(end_row, total)
+    if start >= end:
+        raise agents.ToolError(f"Tranche vide : start_row={start}, end_row={end}, total={total}.")
+    if end - start > MAX_EXPORT_ROWS:
+        end = start + MAX_EXPORT_ROWS
+    base = info["file_name"][:-4] if info["file_name"].lower().endswith(".csv") else info["file_name"]
+    return {
+        "file_name": info["file_name"],
+        "suggested_file_name": f"{base}-export.csv",
+        "total_rows": int(total),
+        "start_row": int(start),
+        "returned_rows": int(end - start),
+        "truncated": bool(end < total),
+        "csv": df.iloc[start:end].to_csv(sep=sep, index=False),
+    }
+
+
+@agents.tool(model_access="direct")
+def split_dataset(
+    ctx: agents.ToolCallbackContext,
+    /,
+    part_rows: Annotated[int, Field(description="Nombre de lignes par partie (défaut 10000, min 100, max 50000).", ge=1)] = 10_000,
+) -> dict[str, Any]:
+    """Découpe le jeu de données chargé en parties de 'part_rows' lignes, pour travailler sur un gros fichier. Chaque partie a un suggested_file_name et son contenu csv quand il tient dans la limite d'export ; sinon récupère-le avec export_csv(start_row, end_row)."""
+    df, info = _dataset(ctx)
+    part_rows = max(100, min(part_rows, 50_000))
+    base = info["file_name"][:-4] if info["file_name"].lower().endswith(".csv") else info["file_name"]
+    parts: list[dict[str, Any]] = []
+    budget = MAX_EXPORT_ROWS
+    for i, start in enumerate(range(0, len(df), part_rows)):
+        chunk = df.iloc[start : start + part_rows]
+        part: dict[str, Any] = {
+            "part": i + 1,
+            "suggested_file_name": f"{base}-part-{i + 1}.csv",
+            "start_row": int(start),
+            "row_count": int(len(chunk)),
+        }
+        if len(chunk) <= min(MAX_PART_CSV_ROWS, budget):
+            part["csv"] = chunk.to_csv(sep=";", index=False)
+            budget -= len(chunk)
+        else:
+            part["csv"] = None
+            part["hint"] = f"Partie trop grosse pour être incluse ici : export_csv(start_row={start}, end_row={start + len(chunk)})."
+        parts.append(part)
+    return {
+        "file_name": info["file_name"],
+        "total_rows": int(len(df)),
+        "part_rows": part_rows,
+        "part_count": len(parts),
+        "parts": parts,
+        "note": 'Pour sauvegarder chaque partie dans Drive : create_file(title=<suggested_file_name>, text_content=<csv de la partie>, content_mime_type="text/csv", disable_conversion_to_google_type=true).',
+    }
+
+
 INSTRUCTIONS = """Tu es un analyste de données conversationnel. L'utilisateur te donne un lien Google Drive vers un fichier CSV et te pose des questions en langage naturel sur ses données. Tu réponds en français, de façon concise, avec des chiffres réels tirés du fichier, jamais inventés.
 
 Procédure de chargement d'un fichier :
@@ -291,13 +393,25 @@ Ensuite, pour répondre aux questions, utilise UNIQUEMENT les outils fournis :
 - preview_rows : montrer les premières lignes.
 - filter_rows : filtrer des lignes (un opérateur à la fois).
 - aggregate_by_group : calculer des agrégats par groupe (count, sum, mean, median, min, max, std, nunique).
+- add_rows : ajouter des lignes au jeu chargé (données trouvées lors de recherches).
+- export_csv : exporter une tranche du jeu en texte CSV.
+- split_dataset : découper un gros jeu en parties.
 
 Règles :
 - Ne jamais exécuter de code et ne jamais inventer de chiffres : chaque réponse chiffrée doit venir d'un résultat d'outil. Si une information manque dans les données, dis-le explicitement.
 - Mémoire : la session conserve tout l'historique de la conversation et le jeu de données chargé reste mémorisé pour la session. L'utilisateur peut te poser des questions de suivi sans se réexpliquer ; réponds directement en t'appuyant sur ce qui a déjà été chargé et discuté. Ne recharge le fichier avec load_csv_dataset que si l'utilisateur donne un nouveau lien, ou si un outil répond qu'aucun jeu de données n'est chargé (par exemple après un redémarrage du worker) : dans ce cas, réutilise le téléchargement déjà présent dans l'historique de la session.
 - Cite les noms de colonnes exacts et les nombres tels que renvoyés par les outils. Quand un résultat est tronqué (returned < matched_rows ou total_groups), dis-le.
-- Le fichier Drive est lu en lecture seule : n'appelle jamais create_file, update_file ou copy_file.
-- Si la question ne porte pas sur les données (hors sujet), réponds brièvement que tu es un analyste de données CSV et ramène la conversation vers le fichier chargé."""
+- Le fichier Drive d'origine ne doit JAMAIS être modifié : n'appelle jamais update_file. create_file ne sert qu'à créer de NOUVEAUX fichiers (résultats enrichis, parties découpées), avec content_mime_type="text/csv" et disable_conversion_to_google_type=true pour garder de vrais .csv.
+- Si la question ne porte pas sur les données (hors sujet), réponds brièvement que tu es un analyste de données CSV et ramène la conversation vers le fichier chargé.
+
+ENRICHIR LE JEU DE DONNÉES AVEC DES RECHERCHES (ajouter des données) :
+- Pour tes recherches : cherche dans le Drive de l'utilisateur (search_files avec fullText, list_recent_files, lis d'autres fichiers pertinents avec download_file_content) ; l'utilisateur peut aussi te coller des données trouvées sur le web.
+- Ajoute les données trouvées au jeu chargé avec add_rows (lignes {colonne: valeur} conformes aux colonnes existantes ; aucune colonne inventée). Indique toujours la source de chaque donnée ajoutée (fichier Drive, source citée, connaissance du modèle).
+- Pour sauvegarder le fichier enrichi dans Drive : export_csv pour obtenir le CSV complet, puis create_file(title="<nom>-enrichi.csv", text_content=<csv>, content_mime_type="text/csv", disable_conversion_to_google_type=true). Crée toujours un nouveau fichier, ne modifie pas l'original.
+
+DÉCOUPER UN GROS FICHIER EN PARTIES :
+- split_dataset(part_rows=N) découpe le jeu chargé en parties de N lignes. Chaque partie a un suggested_file_name et son contenu csv inclus quand il est assez petit ; sinon, récupère la tranche avec export_csv(start_row, end_row).
+- Sauvegarde chaque partie dans Drive avec create_file(text_content=<csv de la partie>, content_mime_type="text/csv", disable_conversion_to_google_type=true, title=<suggested_file_name>)."""
 
 agent = agents.Agent(
     model="mistral-large-4",
@@ -305,10 +419,11 @@ agent = agents.Agent(
     description=(
         "Analyste de données conversationnel : lit un fichier CSV depuis le Google Drive de l'utilisateur "
         "via son connecteur, puis répond en langage naturel avec des chiffres réels (colonnes, filtres, agrégats par groupe). "
-        "Outils fixes uniquement, sans exécution de code."
+        "Peut aussi enrichir le jeu avec des recherches (add_rows) et découper les gros fichiers en parties (split_dataset), "
+        "puis sauvegarder les nouveaux fichiers dans Drive. Outils fixes uniquement, sans exécution de code."
     ),
     instructions=INSTRUCTIONS,
-    tools=[load_csv_dataset, describe_columns, preview_rows, filter_rows, aggregate_by_group],
+    tools=[load_csv_dataset, describe_columns, preview_rows, filter_rows, aggregate_by_group, add_rows, export_csv, split_dataset],
     connectors=[agents.connector("google_drive_mcp")],
     builtins=agents.Builtins(skills=False, subagents=False, background_processes=False),
     permission_policy=agents.PermissionPolicy(
@@ -317,9 +432,10 @@ agent = agents.Agent(
             agents.PermissionRule(
                 tools=("connector_google_drive_mcp.*",),
                 denylist=(
-                    "connector_google_drive_mcp.create_file",
+                    # Le fichier d'origine est en lecture seule : jamais de modification.
+                    # create_file reste autorisé pour sauvegarder les nouveaux fichiers
+                    # (jeu enrichi, parties découpées) créés par l'agent.
                     "connector_google_drive_mcp.update_file",
-                    "connector_google_drive_mcp.copy_file",
                 ),
                 decision="allow",
             ),
@@ -327,4 +443,5 @@ agent = agents.Agent(
     ),
     max_iterations=30,
     first_output_timeout_seconds=900,
+)
 )
