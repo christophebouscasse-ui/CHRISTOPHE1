@@ -305,6 +305,20 @@ agent = agents.Agent(
     instructions=INSTRUCTIONS,
     tools=[load_csv_dataset, describe_columns, preview_rows, filter_rows, aggregate_by_group],
     connectors=[agents.connector("google_drive_mcp")],
-    builtins=agents.Builtins(skills=False, subagents=False, programmatic_tool_calling=False, background_processes=False),
+    builtins=agents.Builtins(skills=False, subagents=False, background_processes=False),
+    permission_policy=agents.PermissionPolicy(
+        default="allow",
+        rules=(
+            agents.PermissionRule(
+                tools=("connector_google_drive_mcp.*",),
+                denylist=(
+                    "connector_google_drive_mcp.create_file",
+                    "connector_google_drive_mcp.update_file",
+                    "connector_google_drive_mcp.copy_file",
+                ),
+                decision="allow",
+            ),
+        ),
+    ),
     max_iterations=30,
 )
