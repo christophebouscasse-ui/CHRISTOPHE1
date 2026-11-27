@@ -259,6 +259,11 @@ def aggregate_by_group(
             raise agents.ToolError(
                 f"Colonne d'agrégation inconnue {col!r}. Colonnes disponibles: {', '.join(str(c) for c in df.columns)}."
             )
+        if fn not in ("count", "nunique") and not pd.api.types.is_numeric_dtype(df[col]):
+            raise agents.ToolError(
+                f"La colonne {col!r} n'est pas numérique (type {df[col].dtype}) : {fn} ne s'applique pas. "
+                "Utilisez count ou nunique, ou une colonne numérique."
+            )
         named[f"{col}__{fn}"] = (col, fn)
     grouped = df.groupby(list(group_by), dropna=False).agg(**named).reset_index()
     total = len(grouped)
